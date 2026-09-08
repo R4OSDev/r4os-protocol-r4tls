@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.2.6`
+- Version: `0.2.7`
 - Image target: `/R4OS/PROTOCOLS/R4TLS.R4P`
 - Image scope: `slim`
 - Canonical project manifest: `module.R4MF`
@@ -53,3 +53,15 @@ leitet die Schluessel aus genau diesem Secret ab. Lokale Secret-Kopien werden
 nach Verwendung geloescht; keine vollstaendige Speicherbereinigung behauptet.
 Konstante ECDH-Werte bleiben ausschliesslich in isolierten Prueffaellen.
 TLS-Zertifikat und RSA-Schluessel sind weiterhin gesondertes Systemmaterial.
+
+
+CredSSP-Public-Key ab 0.78.62
+---------------------------
+R4TLS 0.2.7 stellt mit Op33 den ASN.1 SubjectPublicKey fuer einen bestehenden
+R4LK-Stream bereit. Eingabe: genau140 Bytes R4LK. Ausgabe: Public-Key-DER.
+Der SHA256-Wert am Ende von R4LK bezeichnet das gesamte Zertifikat, keinen
+Public-Key-Hash. Op33 prueft ihn gegen das aktuelle geladene Zertifikat und
+liefert nur bei Uebereinstimmung dessen geparsten Public-Key. Fehlendes oder
+inzwischen geaendertes Material erzeugt einen Fehler mit Ausgabelaenge0.
+R4AUTH verwendet diesen Schluessel fuer die CredSSP-Bindung; RDPSVC bleibt
+Konsument. Vorhandene TLS-Handshake-/Recordformate bleiben unveraendert.

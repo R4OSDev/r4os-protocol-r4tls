@@ -42,6 +42,7 @@ pub const op_tls12_client_finish: u32 = 29;
 pub const op_tls12_client_app_write: u32 = 30;
 pub const op_tls12_client_app_read: u32 = 31;
 pub const op_tls12_client_harness: u32 = 32;
+pub const op_tls12_server_binding_key: u32 = 33;
 
 const tls_record_header_len: usize = 5;
 const tls_max_fragment_len: usize = 16 * 1024;
@@ -459,6 +460,7 @@ export fn r4tls_dispatch(op: u32, in_buffer: *const r4os.abi.ProtocolBuffer, out
         op_tls12_client_app_write => tls12ClientAppWriteDispatch(in_buffer, out_buffer),
         op_tls12_client_app_read => tls12ClientAppReadDispatch(in_buffer, out_buffer),
         op_tls12_client_harness => tls12ClientHarnessDispatch(in_buffer, out_buffer),
+        op_tls12_server_binding_key => tls12ServerBindingKeyDispatch(in_buffer, out_buffer),
         else => -4,
     };
 }
@@ -3250,6 +3252,24 @@ fn parseTls12LiveState(input: []const u8) ?Tls12LiveStateView {
         .server_random = server_random,
         .server_secret = server_secret,
     };
+}
+
+// CredSSP binds to the ASN.1 SubjectPublicKey used by this TLS connection.
+// R4LK stores a certificate fingerprint, not those public-key bytes. Keep
+// certificate parsing in the TLS owner and reject material changed since
+// the stream was established.
+fn tls12ServerBindingKeyDispatch(in_buffer: *const r4os.abi.ProtocolBuffer, out_buffer: *r4os.abi.ProtocolBuffer) i32 {
+    const input = inputBytes(in_buffer) orelse return stream_result_bad_buffer;
+    if (input.len != tls12_live_stream_state_len) return stream_result_malformed_record;
+    const stream = parseTls12LiveStreamState(input) orelse return stream_result_malformed_record;
+    ensureSystemTlsMaterialLoaded();
+    if (!system_cert_loaded or system_cert_der_len == 0) return stream_result_material_missing;
+    var fingerprint: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(system_cert_der[0..system_cert_der_len], &fingerprint, .{});
+    if (!std.mem.eql(u8, stream.cert_hash, &fingerprint)) return stream_result_integrity_failed;
+    const certificate = Certificate{ .buffer = system_cert_der[0..system_cert_der_len], .index = 0 };
+    const parsed = certificate.parse() catch return stream_result_material_invalid;
+    return writeOut(out_buffer, parsed.pubKey());
 }
 
 fn writeTls12LiveStreamState(out: []u8, keys: Tls12SessionKeys) ?usize {
