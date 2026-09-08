@@ -122,7 +122,7 @@ const dev_certificate_fixture = "R4OS-DEV-TLS-CERT-FIXTURE-05518";
 const stream_fixture_tag_seed = "R4TLS05519STREAM";
 const fixture_x25519_secret = [_]u8{ 0xa5, 0x46, 0xe3, 0x6b, 0xf0, 0x52, 0x7c, 0x9d, 0x3b, 0x16, 0x15, 0x4b, 0x82, 0x46, 0x5e, 0xdd, 0x62, 0x14, 0x4c, 0x0a, 0xc1, 0xfc, 0x5a, 0x18, 0x50, 0x6a, 0x22, 0x44, 0xba, 0x44, 0x9a, 0xc4 };
 const fixture_x25519_public = [_]u8{ 0xe6, 0xdb, 0x68, 0x67, 0x58, 0x30, 0x30, 0xdb, 0x35, 0x94, 0xc1, 0xa4, 0x24, 0xb1, 0x5f, 0x7c, 0x72, 0x66, 0x24, 0xec, 0x26, 0xb3, 0x35, 0x3b, 0x10, 0xa9, 0x03, 0xa6, 0xd0, 0xab, 0x1c, 0x4c };
-const server_x25519_secret = [_]u8{ 0x53, 0x22, 0x91, 0x8d, 0x34, 0xf1, 0xa8, 0xc7, 0x0b, 0x66, 0x3c, 0x14, 0xd2, 0x81, 0x5a, 0x9f, 0xe0, 0x42, 0x7b, 0x21, 0x6c, 0xba, 0x5d, 0x33, 0x18, 0xa4, 0x7e, 0xc1, 0x90, 0x0f, 0xb6, 0x2d };
+const fixture_server_secret = [_]u8{ 0x53, 0x22, 0x91, 0x8d, 0x34, 0xf1, 0xa8, 0xc7, 0x0b, 0x66, 0x3c, 0x14, 0xd2, 0x81, 0x5a, 0x9f, 0xe0, 0x42, 0x7b, 0x21, 0x6c, 0xba, 0x5d, 0x33, 0x18, 0xa4, 0x7e, 0xc1, 0x90, 0x0f, 0xb6, 0x2d };
 const magic_key_schedule_in = "R4K1";
 const magic_key_schedule_out = "R4KR";
 const magic_record_protect_in = "R4RP";
@@ -133,7 +133,7 @@ const magic_rsa_sign_in = "R4SG";
 const magic_rsa_sign_out = "R4SR";
 const magic_tls12_live_begin_out = "R4LB";
 const magic_tls12_live_finish_out = "R4LF";
-const magic_tls12_live_state = "R4LS";
+const magic_tls12_live_state = "R4L2";
 const magic_tls12_live_stream = "R4LK";
 const magic_tls12_app_write_in = "R4AW";
 const magic_tls12_app_write_out = "R4WX";
@@ -157,7 +157,7 @@ const cert_der_field = "CERT_DER_HEX";
 const signature_scheme_name = "RSA_PKCS1_SHA256";
 const RsaModulus = std.crypto.ff.Modulus(rsa_max_modulus_bits);
 const tls12_live_header_len: usize = 12;
-const tls12_live_state_header_len: usize = 4 + 4 + tls_random_len + tls_random_len;
+const tls12_live_state_header_len: usize = 4 + 4 + tls_random_len + tls_random_len + X25519.secret_length;
 const tls12_live_stream_state_len: usize = 4 + 8 + 8 + tls_aes_128_key_len + tls_aes_128_key_len + tls_aes_gcm_fixed_iv_len + tls_aes_gcm_fixed_iv_len + tls_master_secret_len + Sha256.digest_length;
 const tls12_live_stream_client_seq_offset: usize = 4;
 const tls12_live_stream_server_seq_offset: usize = tls12_live_stream_client_seq_offset + 8;
@@ -187,6 +187,7 @@ pub const stream_result_unsupported_record: i32 = -7;
 pub const stream_result_integrity_failed: i32 = -8;
 pub const stream_result_material_missing: i32 = -9;
 pub const stream_result_material_invalid: i32 = -10;
+pub const stream_result_entropy_unavailable: i32 = -11;
 
 var system_cert_bytes: u32 = 0;
 var system_key_bytes: u32 = 0;
@@ -319,6 +320,7 @@ const Tls12LiveStateView = struct {
     transcript: []const u8,
     client_random: [tls_random_len]u8,
     server_random: [tls_random_len]u8,
+    server_secret: [X25519.secret_length]u8,
 };
 
 const Tls12LiveStreamView = struct {
@@ -423,6 +425,7 @@ export fn r4tls_query(out: *r4os.abi.ProtocolStatus) callconv(.c) i32 {
 }
 
 export fn r4tls_dispatch(op: u32, in_buffer: *const r4os.abi.ProtocolBuffer, out_buffer: *r4os.abi.ProtocolBuffer) callconv(.c) i32 {
+    out_buffer.len = 0;
     return switch (op) {
         op_capabilities => writeOut(out_buffer, "role=security.tls;stage=tls12-client-server-app-stream;tls12=parse+plan+client+server+app-records+prf+x25519+p256+aes128gcm-records+rsa-pkcs1-sha256+ecdsa-p256-p384-sha256-sha384+x509;roots=external;tls13=boundary"),
         op_classify_record => classifyRecord(in_buffer, out_buffer),
@@ -529,6 +532,7 @@ const ServerHandshakePlan = struct {
     selected_signature: u16 = tls_signature_rsa_pkcs1_sha256,
     client_random: [tls_random_len]u8 = .{0} ** tls_random_len,
     server_random: [tls_random_len]u8 = .{0} ** tls_random_len,
+    server_secret: [X25519.secret_length]u8 = .{0} ** X25519.secret_length,
 };
 
 fn recordHeader(input: []const u8) ?TlsRecordHeader {
@@ -753,7 +757,8 @@ fn parseKeyShare(data: []const u8, info: *ClientHelloInfo) bool {
 fn planServerHandshake(in_buffer: *const r4os.abi.ProtocolBuffer, out_buffer: *r4os.abi.ProtocolBuffer) i32 {
     const input = inputBytes(in_buffer) orelse return -2;
     const info = parseClientHelloInfo(input) orelse return -6;
-    const plan = planServerHandshakeInfo(info) orelse return -7;
+    var plan = planServerHandshakeInfo(info) catch |err| return serverPlanErrorCode(err);
+    defer std.crypto.secureZero(u8, &plan.server_secret);
     var text: [640]u8 = .{0} ** 640;
     var pos: usize = 0;
     appendText(text[0..], &pos, "serverhandshake;mode=tls12;record=");
@@ -782,25 +787,34 @@ fn planServerHandshake(in_buffer: *const r4os.abi.ProtocolBuffer, out_buffer: *r
     return writeOut(out_buffer, text[0..pos]);
 }
 
-fn planServerHandshakeInfo(info: ClientHelloInfo) ?ServerHandshakePlan {
-    if (!info.has_tls12_version) return null;
-    if (!info.has_cipher_ecdhe_rsa_aes128_gcm_sha256) return null;
-    if (!info.has_group_x25519) return null;
-    if (!info.has_signature_rsa_pkcs1_sha256) return null;
-    var server_random: [tls_random_len]u8 = .{0} ** tls_random_len;
-    fillSequence(server_random[0..], 0xA0);
-    return .{
+const ServerPlanError = error{ Unsupported, EntropyUnavailable };
+
+fn serverPlanErrorCode(err: ServerPlanError) i32 {
+    return switch (err) {
+        error.Unsupported => stream_result_unsupported_record,
+        error.EntropyUnavailable => stream_result_entropy_unavailable,
+    };
+}
+
+fn planServerHandshakeInfo(info: ClientHelloInfo) ServerPlanError!ServerHandshakePlan {
+    if (!info.has_tls12_version or !info.has_cipher_ecdhe_rsa_aes128_gcm_sha256 or
+        !info.has_group_x25519 or !info.has_signature_rsa_pkcs1_sha256) return error.Unsupported;
+    var plan = ServerHandshakePlan{
         .tls13_seen = info.has_tls13_version,
         .secure_renegotiation = info.has_secure_renegotiation,
         .client_random = info.client_random,
-        .server_random = server_random,
     };
+    errdefer std.crypto.secureZero(u8, &plan.server_secret);
+    if (!r4os.secure_random.fill(&plan.server_secret) or !r4os.secure_random.fill(&plan.server_random))
+        return error.EntropyUnavailable;
+    return plan;
 }
 
 fn buildServerHandshakeFixture(in_buffer: *const r4os.abi.ProtocolBuffer, out_buffer: *r4os.abi.ProtocolBuffer) i32 {
     const input = inputBytes(in_buffer) orelse return -2;
     const info = parseClientHelloInfo(input) orelse return -6;
-    const plan = planServerHandshakeInfo(info) orelse return -7;
+    var plan = planServerHandshakeInfo(info) catch |err| return serverPlanErrorCode(err);
+    defer std.crypto.secureZero(u8, &plan.server_secret);
     const material = getSystemTlsMaterial() orelse return stream_result_material_missing;
     const out = outputBytes(out_buffer) orelse return -2;
     const len = buildServerHandshakeRecord(out, plan, material) orelse return -5;
@@ -973,7 +987,7 @@ fn describeProductiveContract(in_buffer: *const r4os.abi.ProtocolBuffer, out_buf
     appendText(text[0..], &pos, ";rsa_signature=");
     appendText(text[0..], &pos, signatureSchemeName());
     appendText(text[0..], &pos, ";server_ecdh=derived-x25519-public");
-    appendText(text[0..], &pos, ";server_ecdh_scope=static-dev-until-session-rng");
+    appendText(text[0..], &pos, ";server_ecdh_scope=per-session-hardware-entropy");
     appendText(text[0..], &pos, ";session_state=clientkeyexchange+ccs+finished");
     appendText(text[0..], &pos, ";finished=client-verify+server-verify");
     appendText(text[0..], &pos, ";aad=seq64+type+0303+plain_len");
@@ -1679,7 +1693,7 @@ fn describeTls12SessionContract(in_buffer: *const r4os.abi.ProtocolBuffer, out_b
     appendText(text[0..], &pos, ";sequence=client0/server0");
     appendText(text[0..], &pos, ";negative=bad-clientkeyexchange,bad-finished-tag,bad-transcript");
     appendText(text[0..], &pos, ";rdpsvc=consumer-only");
-    appendText(text[0..], &pos, ";live_state=R4LS");
+    appendText(text[0..], &pos, ";live_state=R4L2");
     appendText(text[0..], &pos, ";stream_state=R4LK");
     appendText(text[0..], &pos, ";next=credssp");
     return writeOut(out_buffer, text[0..pos]);
@@ -1825,7 +1839,8 @@ fn tls12X25519Dispatch(in_buffer: *const r4os.abi.ProtocolBuffer, out_buffer: *r
 fn tls12LiveBeginDispatch(in_buffer: *const r4os.abi.ProtocolBuffer, out_buffer: *r4os.abi.ProtocolBuffer) i32 {
     const client_hello = inputBytes(in_buffer) orelse return stream_result_bad_buffer;
     const client_info = parseClientHelloInfo(client_hello) orelse return stream_result_malformed_record;
-    const plan = planServerHandshakeInfo(client_info) orelse return stream_result_unsupported_record;
+    var plan = planServerHandshakeInfo(client_info) catch |err| return serverPlanErrorCode(err);
+    defer std.crypto.secureZero(u8, &plan.server_secret);
     const material = getSystemTlsMaterial() orelse return stream_result_material_missing;
 
     var server_record: [4096]u8 = .{0} ** 4096;
@@ -1841,7 +1856,7 @@ fn tls12LiveBeginDispatch(in_buffer: *const r4os.abi.ProtocolBuffer, out_buffer:
     const out = outputBytes(out_buffer) orelse return stream_result_bad_buffer;
     if (out.len < tls12_live_header_len) return stream_result_buffer_small;
     const state_offset = tls12_live_header_len;
-    const state_len = writeTls12LiveState(out[state_offset..], client_info.client_random, plan.server_random, transcript[0..transcript_len]) orelse return stream_result_buffer_small;
+    const state_len = writeTls12LiveState(out[state_offset..], client_info.client_random, plan.server_random, plan.server_secret, transcript[0..transcript_len]) orelse return stream_result_buffer_small;
     const server_offset = state_offset + state_len;
     const total_len = server_offset + server_record_len;
     if (total_len > out.len) return stream_result_buffer_small;
@@ -1856,7 +1871,8 @@ fn tls12LiveBeginDispatch(in_buffer: *const r4os.abi.ProtocolBuffer, out_buffer:
 
 fn tls12LiveFinishDispatch(in_buffer: *const r4os.abi.ProtocolBuffer, out_buffer: *r4os.abi.ProtocolBuffer) i32 {
     const input = inputBytes(in_buffer) orelse return stream_result_bad_buffer;
-    const state = parseTls12LiveState(input) orelse return stream_result_malformed_record;
+    var state = parseTls12LiveState(input) orelse return stream_result_malformed_record;
+    defer std.crypto.secureZero(u8, &state.server_secret);
     const flight = input[state.total_len..];
     if (flight.len < tls_record_header_len) return stream_result_would_block;
 
@@ -1877,7 +1893,7 @@ fn tls12LiveFinishDispatch(in_buffer: *const r4os.abi.ProtocolBuffer, out_buffer
     if (flight.len < pos + client_finished_record_len) return stream_result_would_block;
     const client_finished_record = flight[pos .. pos + client_finished_record_len];
 
-    const shared_secret = X25519.scalarmult(server_x25519_secret, client_public) catch return stream_result_integrity_failed;
+    const shared_secret = X25519.scalarmult(state.server_secret, client_public) catch return stream_result_integrity_failed;
     if (allZero(shared_secret[0..])) return stream_result_integrity_failed;
     const keys = deriveTls12SessionKeys(shared_secret, state.client_random, state.server_random);
     if (allZero(keys.master[0..]) or allZero(keys.client_key[0..]) or allZero(keys.server_key[0..])) return stream_result_integrity_failed;
@@ -2723,9 +2739,9 @@ fn runTls12ClientHarness() i32 {
 
 fn selftestP256KeyAgreement() bool {
     const client_point = P256.basePoint.mul(fixture_x25519_secret, .big) catch return false;
-    const server_point = P256.basePoint.mul(server_x25519_secret, .big) catch return false;
+    const server_point = P256.basePoint.mul(fixture_server_secret, .big) catch return false;
     const client_shared = server_point.mul(fixture_x25519_secret, .big) catch return false;
-    const server_shared = client_point.mul(server_x25519_secret, .big) catch return false;
+    const server_shared = client_point.mul(fixture_server_secret, .big) catch return false;
     const client_x = client_shared.affineCoordinates().x.toBytes(.big);
     const server_x = server_shared.affineCoordinates().x.toBytes(.big);
     if (!std.mem.eql(u8, client_x[0..], server_x[0..]) or allZero(client_x[0..])) return false;
@@ -2809,7 +2825,8 @@ fn runTls12SessionHarness(result: *Tls12SessionHarnessResult) i32 {
     var client_hello: [192]u8 = .{0} ** 192;
     const client_hello_len = buildClientHelloFixture(client_hello[0..]);
     const client_info = parseClientHelloInfo(client_hello[0..client_hello_len]) orelse return stream_result_malformed_record;
-    const plan = planServerHandshakeInfo(client_info) orelse return stream_result_unsupported_record;
+    var plan = planServerHandshakeInfo(client_info) catch |err| return serverPlanErrorCode(err);
+    defer std.crypto.secureZero(u8, &plan.server_secret);
     const material = getSystemTlsMaterial() orelse return stream_result_material_missing;
 
     var server_record: [4096]u8 = .{0} ** 4096;
@@ -2828,7 +2845,7 @@ fn runTls12SessionHarness(result: *Tls12SessionHarnessResult) i32 {
     bad_client_key_exchange[tls_record_header_len + 4] = X25519.public_length - 1;
     if (parseClientKeyExchangeRecord(bad_client_key_exchange[0..client_key_exchange_len]) != null) return stream_result_malformed_record;
 
-    const shared_secret = X25519.scalarmult(server_x25519_secret, client_public) catch return stream_result_integrity_failed;
+    const shared_secret = X25519.scalarmult(plan.server_secret, client_public) catch return stream_result_integrity_failed;
     if (allZero(shared_secret[0..])) return stream_result_integrity_failed;
     const keys = deriveTls12SessionKeys(shared_secret, client_info.client_random, plan.server_random);
     if (allZero(keys.master[0..]) or allZero(keys.client_key[0..]) or allZero(keys.server_key[0..])) return stream_result_integrity_failed;
@@ -3118,7 +3135,7 @@ fn selftestTls12ApplicationRecords(stream_state: []const u8) i32 {
 fn buildTls12LiveClientFlight(state: Tls12LiveStateView, out: []u8) ?usize {
     var client_key_exchange: [64]u8 = .{0} ** 64;
     const client_key_exchange_len = buildClientKeyExchangeRecord(client_key_exchange[0..], fixture_x25519_public[0..]) orelse return null;
-    const shared_secret = X25519.scalarmult(server_x25519_secret, fixture_x25519_public) catch return null;
+    const shared_secret = X25519.scalarmult(state.server_secret, fixture_x25519_public) catch return null;
     const keys = deriveTls12SessionKeys(shared_secret, state.client_random, state.server_random);
 
     var transcript: [tls12_live_max_transcript_len]u8 = .{0} ** tls12_live_max_transcript_len;
@@ -3194,7 +3211,7 @@ fn deriveTls12TrafficKeys(master: [tls_master_secret_len]u8, client_random: [tls
     return keys;
 }
 
-fn writeTls12LiveState(out: []u8, client_random: [tls_random_len]u8, server_random: [tls_random_len]u8, transcript: []const u8) ?usize {
+fn writeTls12LiveState(out: []u8, client_random: [tls_random_len]u8, server_random: [tls_random_len]u8, server_secret: [X25519.secret_length]u8, transcript: []const u8) ?usize {
     if (transcript.len > tls12_live_max_transcript_len) return null;
     const total = tls12_live_state_header_len + transcript.len;
     if (out.len < total) return null;
@@ -3207,6 +3224,8 @@ fn writeTls12LiveState(out: []u8, client_random: [tls_random_len]u8, server_rand
     pos += tls_random_len;
     @memcpy(out[pos .. pos + tls_random_len], server_random[0..]);
     pos += tls_random_len;
+    @memcpy(out[pos .. pos + X25519.secret_length], &server_secret);
+    pos += X25519.secret_length;
     if (transcript.len != 0) @memcpy(out[pos .. pos + transcript.len], transcript);
     return total;
 }
@@ -3222,11 +3241,14 @@ fn parseTls12LiveState(input: []const u8) ?Tls12LiveStateView {
     var server_random: [tls_random_len]u8 = undefined;
     @memcpy(client_random[0..], input[8 .. 8 + tls_random_len]);
     @memcpy(server_random[0..], input[8 + tls_random_len .. 8 + tls_random_len + tls_random_len]);
+    const secret_offset = 8 + tls_random_len + tls_random_len;
+    const server_secret = input[secret_offset..][0..X25519.secret_length].*;
     return .{
         .total_len = total,
         .transcript = input[tls12_live_state_header_len..total],
         .client_random = client_random,
         .server_random = server_random,
+        .server_secret = server_secret,
     };
 }
 
@@ -3412,7 +3434,7 @@ fn appendServerKeyExchangePlan(out: []u8, pos_start: usize, plan: ServerHandshak
     pos += 2;
     out[pos] = @intCast(X25519.public_length);
     pos += 1;
-    const server_public = X25519.recoverPublicKey(server_x25519_secret) catch return null;
+    const server_public = X25519.recoverPublicKey(plan.server_secret) catch return null;
     @memcpy(out[pos .. pos + X25519.public_length], server_public[0..]);
     pos += X25519.public_length;
     const params = out[params_start..pos];
@@ -3485,7 +3507,8 @@ fn selftest(out_buffer: *r4os.abi.ProtocolBuffer) i32 {
     if (!contains(hello_text, "rsa_pkcs1=yes")) return -6;
 
     const client_info = parseClientHelloInfo(client_hello[0..client_hello_len]) orelse return -6;
-    const plan = planServerHandshakeInfo(client_info) orelse return -6;
+    var plan = planServerHandshakeInfo(client_info) catch |err| return serverPlanErrorCode(err);
+    defer std.crypto.secureZero(u8, &plan.server_secret);
     if (plan.selected_cipher != tls_cipher_ecdhe_rsa_aes_128_gcm_sha256) return -6;
     var plan_text_buf: [640]u8 = .{0} ** 640;
     var plan_out = r4os.abi.ProtocolBuffer{
@@ -3505,8 +3528,9 @@ fn selftest(out_buffer: *r4os.abi.ProtocolBuffer) i32 {
         .len = 0,
         .capacity = server_fixture.len,
     };
-    const server_rc = buildServerHandshakeFixture(&hello_in, &server_out);
-    if (server_rc != 0) return server_rc;
+    const selftest_material = getSystemTlsMaterial() orelse return stream_result_material_missing;
+    const server_len = buildServerHandshakeRecord(&server_fixture, plan, selftest_material) orelse return stream_result_buffer_small;
+    server_out.len = @intCast(server_len);
     if (server_out.len == 0) return -6;
     const server_record = recordHeader(server_fixture[0..@intCast(server_out.len)]) orelse return -6;
     if (server_record.content_type != tls_content_handshake or server_record.fragment_len + tls_record_header_len != server_out.len) return -6;
@@ -3516,7 +3540,7 @@ fn selftest(out_buffer: *r4os.abi.ProtocolBuffer) i32 {
     if (!hasHandshakeMessage(server_fragment, tls_handshake_server_key_exchange)) return -6;
     if (!hasHandshakeMessage(server_fragment, tls_handshake_server_hello_done)) return -6;
     const ske_public = serverKeyExchangePublicKey(server_fragment) orelse return -6;
-    const expected_server_public = X25519.recoverPublicKey(server_x25519_secret) catch return -6;
+    const expected_server_public = X25519.recoverPublicKey(plan.server_secret) catch return -6;
     if (!std.mem.eql(u8, ske_public, expected_server_public[0..])) return -6;
     if (isLegacyServerKeyPlaceholder(ske_public)) return -6;
     const ske_signature_len = serverKeyExchangeSignatureLen(server_fragment) orelse return -6;
@@ -3783,12 +3807,20 @@ fn selftest(out_buffer: *r4os.abi.ProtocolBuffer) i32 {
     var bad_cipher_hello: [192]u8 = .{0} ** 192;
     const bad_cipher_len = buildClientHelloFixtureVariant(bad_cipher_hello[0..], false, true);
     const bad_cipher_info = parseClientHelloInfo(bad_cipher_hello[0..bad_cipher_len]) orelse return -6;
-    if (planServerHandshakeInfo(bad_cipher_info) != null) return -6;
+    if (planServerHandshakeInfo(bad_cipher_info)) |_| {
+        return -6;
+    } else |err| {
+        if (err != error.Unsupported) return -6;
+    }
 
     var bad_version_hello: [192]u8 = .{0} ** 192;
     const bad_version_len = buildClientHelloFixtureVariant(bad_version_hello[0..], true, false);
     const bad_version_info = parseClientHelloInfo(bad_version_hello[0..bad_version_len]) orelse return -6;
-    if (planServerHandshakeInfo(bad_version_info) != null) return -6;
+    if (planServerHandshakeInfo(bad_version_info)) |_| {
+        return -6;
+    } else |err| {
+        if (err != error.Unsupported) return -6;
+    }
     if (runTls12ClientHarness() != stream_result_ok) return -6;
 
     client_hello[4] = 127;

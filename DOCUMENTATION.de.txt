@@ -79,22 +79,15 @@ Fixture nutzt seit 0.55.24 die geladenen DER-Zertifikatsbytes und schreibt in
 ServerKeyExchange keine leere Platzhaltersignatur mehr, sondern eine echte
 Signatur ueber `client_random + server_random + ecdh_params`.
 
-Seit 0.55.26 nutzt ServerKeyExchange auch fuer X25519 kein synthetisches
-Public-Key-Platzhalterfeld mehr. R4TLS haelt ein eigenes Server-Secret fuer den
-aktuellen Entwicklungsserverpfad und schreibt den daraus ableitbaren
-X25519-Public-Key in die `ecdh_params`. Der Selftest extrahiert diesen Public
-Key aus der erzeugten ServerHandshake-Fixture, vergleicht ihn mit
-`X25519.recoverPublicKey(server_x25519_secret)` und verwirft den alten
-`0x40..0x5F`-Platzhalter explizit. Das ist noch kein vollstaendiger
-TLS-Sessionzustand, beseitigt aber einen echten spaeteren mstsc-
-KeyAgreement-Blocker.
+ServerKeyExchange verwendet den Public-Key des frischen sitzungseigenen
+X25519-Secrets (siehe aktuellen Vertrag 0.78.61 unten).
 
 Seit 0.55.27 besitzt R4TLS einen eigenstaendigen TLS-1.2-Session-Harness.
 `op_tls12_session_contract` (`op20`) beschreibt den Besitz von
 ClientKeyExchange, ChangeCipherSpec, Finished-Verifikation, Server-Finished
 und Sequenzen. `op_tls12_session_harness` (`op21`) verbindet die vorhandenen
 ClientHello-, ServerHandshake-, X25519-, PRF- und AES-GCM-Kanten zu einer
-deterministischen Session-Sequenz. Der Harness parst ClientKeyExchange,
+Session-Sequenz mit frischen Serverwerten. Der Harness parst ClientKeyExchange,
 berechnet das Shared Secret aus dem R4TLS-Server-Secret und dem Client-Public-
 Key, leitet Master Secret und Write-Keys ab, verschluesselt den Client-
 Finished-Record, oeffnet und verifiziert ihn, erzeugt danach den Server-
@@ -104,12 +97,12 @@ Bad-Finished-Tag und falschen Transcript-Hash.
 Seit 0.55.30 besitzt R4TLS zusaetzlich die Live-Session-Schnittstelle fuer
 echte Client-Flights. `op_tls12_live_begin` (`op22`) nimmt einen
 TLS-ClientHello-Record entgegen, plant und baut den ServerHandshake und gibt
-`R4LB` mit serialisiertem `R4LS`-Sessionzustand sowie der ServerHandshake-
-Flight zurueck. `R4LS` enthaelt Client-/Server-Random und das bisherige
+`R4LB` mit serialisiertem `R4L2`-Sessionzustand sowie der ServerHandshake-
+Flight zurueck. `R4L2` enthaelt Client-/Server-Random, Server-Secret und das bisherige
 Handshake-Transcript, damit der naechste Aufruf ohne RDPSVC-private
 TLS-Zustandslogik fortsetzen kann.
 
-`op_tls12_live_finish` (`op23`) nimmt `R4LS` plus ClientKeyExchange,
+`op_tls12_live_finish` (`op23`) nimmt `R4L2` plus ClientKeyExchange,
 ChangeCipherSpec und verschluesselten Client-Finished-Record entgegen,
 berechnet Shared Secret, Master Secret und AES-GCM-Keys, oeffnet und
 verifiziert Client Finished und liefert danach `R4LF`. Darin liegen ein
@@ -188,3 +181,18 @@ Die naechsten Ausbaustufen gehoeren hierher:
 RDPSVC darf diese Logik nicht privat duplizieren. Der Dienst bleibt RDP-
 Konsument und nutzt spaeter den Protocol-Dispatch beziehungsweise eine daraus
 abgeleitete SDK-Komfortschicht.
+
+
+Sitzungszufall ab 0.78.61
+-----------------------
+X25519-Server-Secret und server_random werden fuer jeden Handshake getrennt
+mit SDK secure_random.fill erzeugt. Keine Uhren-/Kennungsableitung und kein
+konstanter Produktwert. Fehlende Entropie liefert -11 bei Ausgabelaenge 0.
+R4LB enthaelt nun den privaten R4L2-Zustand: Magic4, Transcriptlaenge4,
+client_random32, server_random32, server_secret32, Transcript (max.8192).
+R4LS wird abgewiesen. Der Aufrufer behaelt den Zustand bis LiveFinish und
+uebertraegt ausschliesslich die getrennte Server-Flight an den Peer. Finish
+leitet die Schluessel aus genau diesem Secret ab. Lokale Secret-Kopien werden
+nach Verwendung geloescht; keine vollstaendige Speicherbereinigung behauptet.
+Konstante ECDH-Werte bleiben ausschliesslich in isolierten Prueffaellen.
+TLS-Zertifikat und RSA-Schluessel sind weiterhin gesondertes Systemmaterial.
