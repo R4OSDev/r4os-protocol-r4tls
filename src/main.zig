@@ -2,8 +2,10 @@ const r4os = @import("r4os");
 const std = @import("std");
 
 const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
-const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
-const Sha256 = std.crypto.hash.sha2.Sha256;
+const Sha256 = r4os.crypto_sha256.Sha256(shaExecutor);
+const HmacSha256 = std.crypto.auth.hmac.Hmac(Sha256);
+var sha_executor: ?r4os.cpu_acceleration.WorkFn = null;
+fn shaExecutor() ?r4os.cpu_acceleration.WorkFn { return sha_executor; }
 const Sha384 = std.crypto.hash.sha2.Sha384;
 const X25519 = std.crypto.dh.X25519;
 const P256 = std.crypto.ecc.P256;
@@ -401,6 +403,12 @@ comptime {
 
 export fn r4tls_init(api: *const r4os.r4dev.ProtocolApi) callconv(.c) i32 {
     protocol_api = api;
+    sha_executor = null;
+    if (r4os.cpu_acceleration.protocolInfo(api)) |get_info| {
+        var info: r4os.abi.CpuAccelerationInfo = .{};
+        if (get_info(&info) == 0 and info.os_mask & r4os.abi.cpu_accel_feature_sha != 0)
+            sha_executor = r4os.cpu_acceleration.protocolWork(api);
+    }
     var ctx = r4os.r4dev.ProtocolContext.init(api);
     ctx.logInfo("R4TLS.R4P init");
     _ = ctx.registerRole("security.tls", .data, 0);
@@ -410,6 +418,7 @@ export fn r4tls_init(api: *const r4os.r4dev.ProtocolApi) callconv(.c) i32 {
 }
 
 export fn r4tls_shutdown() callconv(.c) i32 {
+    sha_executor = null;
     protocol_api = null;
     return 0;
 }
@@ -3486,6 +3495,21 @@ fn appendServerHelloDone(out: []u8, pos_start: usize) usize {
 }
 
 fn selftest(out_buffer: *r4os.abi.ProtocolBuffer) i32 {
+    // A real protocol consumer crosses partial/full-block and batch boundaries.
+    var hash_data: [4097]u8 = undefined;
+    for (&hash_data, 0..) |*b, i| b.* = @truncate(i *% 73);
+    var expected_hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(&hash_data, &expected_hash, .{});
+    var hash = Sha256.init(.{});
+    hash.update(hash_data[0..17]);
+    hash.update(hash_data[17..]);
+    const actual_hash = hash.finalResult();
+    if (!std.mem.eql(u8, &expected_hash, &actual_hash)) return -6;
+    var expected_mac: [32]u8 = undefined;
+    var actual_mac: [32]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&expected_mac, &hash_data, "R4TLS SHA256 consumer");
+    HmacSha256.create(&actual_mac, &hash_data, "R4TLS SHA256 consumer");
+    if (!std.mem.eql(u8, &expected_mac, &actual_mac)) return -6;
     const sample = [_]u8{ tls_content_handshake, tls_version_major, tls_version_tls12_minor, 0, 42 };
     var result: [96]u8 = .{0} ** 96;
     var out = r4os.abi.ProtocolBuffer{
