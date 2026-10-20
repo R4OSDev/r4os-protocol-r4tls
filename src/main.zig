@@ -402,6 +402,7 @@ comptime {
 }
 
 export fn r4tls_init(api: *const r4os.r4dev.ProtocolApi) callconv(.c) i32 {
+    r4os.secure_random.bindProtocol(api);
     protocol_api = api;
     sha_executor = null;
     if (r4os.cpu_acceleration.protocolInfo(api)) |get_info| {
