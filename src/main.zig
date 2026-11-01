@@ -99,7 +99,7 @@ const tls_signature_rsa_pss_rsae_sha256: u16 = 0x0804;
 const tls_signature_ecdsa_secp384r1_sha384: u16 = 0x0503;
 const tls_signature_ecdsa_secp256r1_sha256: u16 = 0x0403;
 const tls_signature_rsa_pkcs1_sha256: u16 = 0x0401;
-const rsa_max_modulus_bits: usize = 2048;
+const rsa_max_modulus_bits: usize = 3072;
 const rsa_max_modulus_bytes: usize = rsa_max_modulus_bits / 8;
 const rsa_min_modulus_bytes: usize = 64;
 const rsa_sha256_digest_info_len: usize = 19 + Sha256.digest_length;
@@ -1288,6 +1288,44 @@ fn validateX509Leaf(leaf_der: []const u8, hostname: []const u8, now_utc: u64) ?C
     return validateX509Chain(certificates, 1, hostname, now_utc, &failure);
 }
 
+test "R4OS Server RSA-3072 chain, IP SAN and failure cases" {
+    const root_der = @embedFile("test_fixtures/r4os-server-ca.der");
+    const leaf_der = @embedFile("test_fixtures/r4os-server-leaf.der");
+    const root = (Certificate{ .buffer = root_der, .index = 0 }).parse() catch unreachable;
+    const leaf = (Certificate{ .buffer = leaf_der, .index = 0 }).parse() catch unreachable;
+    const root_key_parts = Certificate.rsa.PublicKey.parseDer(root.pubKey()) catch unreachable;
+    const root_key = RsaKeyContext.fromPublicKey(root_key_parts.modulus, root_key_parts.exponent) orelse unreachable;
+    try std.testing.expectEqual(@as(usize, 384), root_key.modulus_len);
+    try std.testing.expect(rsaPkcs1Sha256Verify(&root_key, leaf.message(), leaf.signature()));
+
+    resetSystemTlsMaterial();
+    defer resetSystemTlsMaterial();
+    @memcpy(system_root_cert_der[0][0..root_der.len], root_der);
+    system_root_cert_der_len[0] = root_der.len;
+    system_root_count = 1;
+    system_root_loaded = true;
+
+    try std.testing.expect(validateX509Leaf(leaf_der, "138.201.253.143", 20261101000000) != null);
+    try std.testing.expect(validateX509Leaf(leaf_der, "172.27.254.3", 20261101000000) != null);
+    try std.testing.expect(validateX509Leaf(leaf_der, "localhost", 20261101000000) != null);
+    try std.testing.expect(validateX509Leaf(leaf_der, "138.201.253.144", 20261101000000) == null);
+    try std.testing.expect(validateX509Leaf(leaf_der, "138.201.253.143", 20261001000000) == null);
+    try std.testing.expect(validateX509Leaf(leaf_der, "138.201.253.143", 20290129000000) == null);
+
+    var bad_leaf: [leaf_der.len]u8 = undefined;
+    @memcpy(&bad_leaf, leaf_der);
+    bad_leaf[bad_leaf.len - 1] ^= 1;
+    try std.testing.expect(validateX509Leaf(&bad_leaf, "138.201.253.143", 20261101000000) == null);
+
+    const modulus_offset = std.mem.indexOf(u8, root_der, root_key_parts.modulus) orelse unreachable;
+    system_root_cert_der[0][modulus_offset] ^= 1;
+    try std.testing.expect(validateX509Leaf(leaf_der, "138.201.253.143", 20261101000000) == null);
+    @memcpy(system_root_cert_der[0][0..root_der.len], root_der);
+    system_root_count = 0;
+    system_root_loaded = false;
+    try std.testing.expect(validateX509Leaf(leaf_der, "138.201.253.143", 20261101000000) == null);
+}
+
 fn validateX509Chain(certificates: [tls_cert_chain_max_count][]const u8, certificate_count: usize, hostname: []const u8, now_utc: u64, failure: *X509ValidationFailure) ?Certificate.Parsed {
     failure.* = .none;
     if (!system_root_loaded or system_root_count == 0 or certificate_count == 0 or certificate_count > tls_cert_chain_max_count) {
@@ -1303,10 +1341,10 @@ fn validateX509Chain(certificates: [tls_cert_chain_max_count][]const u8, certifi
         failure.* = .parse;
         return null;
     };
-    child.verifyHostName(hostname) catch {
+    if (!certificateIdentityMatches(child, hostname)) {
         failure.* = .hostname;
         return null;
-    };
+    }
 
     var index: usize = 1;
     while (index < certificate_count) : (index += 1) {
@@ -1341,6 +1379,51 @@ fn validateX509Chain(certificates: [tls_cert_chain_max_count][]const u8, certifi
     }
     if (failure.* == .none) failure.* = .root;
     return null;
+}
+
+fn certificateIdentityMatches(parsed: Certificate.Parsed, hostname: []const u8) bool {
+    if (parseIpv4Literal(hostname)) |address| {
+        return certificateIpSanMatches(parsed.subjectAltName(), address);
+    }
+    parsed.verifyHostName(hostname) catch return false;
+    return true;
+}
+
+fn parseIpv4Literal(hostname: []const u8) ?[4]u8 {
+    var address: [4]u8 = undefined;
+    var part: usize = 0;
+    var value: u16 = 0;
+    var digits: usize = 0;
+    for (hostname) |character| {
+        if (character == '.') {
+            if (part >= 3 or digits == 0) return null;
+            address[part] = @intCast(value);
+            part += 1;
+            value = 0;
+            digits = 0;
+            continue;
+        }
+        if (character < '0' or character > '9' or digits >= 3 or (digits == 1 and value == 0)) return null;
+        value = value * 10 + (character - '0');
+        if (value > 255) return null;
+        digits += 1;
+    }
+    if (part != 3 or digits == 0) return null;
+    address[3] = @intCast(value);
+    return address;
+}
+
+fn certificateIpSanMatches(san_der: []const u8, address: [4]u8) bool {
+    var position: usize = 0;
+    const names = derElement(san_der, &position) orelse return false;
+    if (names.tag != 0x30 or position != san_der.len) return false;
+    position = 0;
+    var matched = false;
+    while (position < names.value.len) {
+        const name = derElement(names.value, &position) orelse return false;
+        if (name.tag == 0x87 and name.value.len == address.len and std.mem.eql(u8, name.value, address[0..])) matched = true;
+    }
+    return matched;
 }
 
 fn utcStampToUnixSeconds(stamp: u64) ?i64 {
@@ -3496,6 +3579,11 @@ fn appendServerHelloDone(out: []u8, pos_start: usize) usize {
 }
 
 fn selftest(out_buffer: *r4os.abi.ProtocolBuffer) i32 {
+    const ip_san = [_]u8{ 0x30, 0x0c, 0x87, 0x04, 138, 201, 253, 143, 0x87, 0x04, 172, 27, 254, 3 };
+    if (!certificateIpSanMatches(&ip_san, parseIpv4Literal("138.201.253.143") orelse return -6)) return -6;
+    if (!certificateIpSanMatches(&ip_san, parseIpv4Literal("172.27.254.3") orelse return -6)) return -6;
+    if (certificateIpSanMatches(&ip_san, parseIpv4Literal("138.201.253.144") orelse return -6)) return -6;
+    if (parseIpv4Literal("138.201.253.256") != null or parseIpv4Literal("138.201.253.0143") != null) return -6;
     // A real protocol consumer crosses partial/full-block and batch boundaries.
     var hash_data: [4097]u8 = undefined;
     for (&hash_data, 0..) |*b, i| b.* = @truncate(i *% 73);
