@@ -5,7 +5,9 @@ const Aes128Gcm = std.crypto.aead.aes_gcm.Aes128Gcm;
 const Sha256 = r4os.crypto_sha256.Sha256(shaExecutor);
 const HmacSha256 = std.crypto.auth.hmac.Hmac(Sha256);
 var sha_executor: ?r4os.cpu_acceleration.WorkFn = null;
-fn shaExecutor() ?r4os.cpu_acceleration.WorkFn { return sha_executor; }
+fn shaExecutor() ?r4os.cpu_acceleration.WorkFn {
+    return sha_executor;
+}
 const Sha384 = std.crypto.hash.sha2.Sha384;
 const X25519 = std.crypto.dh.X25519;
 const P256 = std.crypto.ecc.P256;
@@ -206,7 +208,7 @@ var system_root_status: TlsMaterialStatus = .missing;
 var system_key_context = RsaKeyContext.empty();
 var system_cert_status: TlsMaterialStatus = .missing;
 var system_key_status: TlsMaterialStatus = .missing;
-var protocol_api: ?*const r4os.r4dev.ProtocolApi = null;
+var protocol_api: ?*const r4os.r4dev.ProtocolApi2 = null;
 
 const TlsMaterialStatus = enum(u8) {
     missing,
@@ -398,29 +400,41 @@ const Tls12ServerFlightError = error{
 };
 
 comptime {
-    asm (r4os.r4dev.protocolEntriesAsm("r4tls_init", "r4tls_shutdown", "r4tls_query", "r4tls_dispatch"));
+    if (!@import("builtin").is_test) asm (r4os.technical2.protocolEntriesAsm("r4tls_init", "r4tls_shutdown", "r4tls_query", "r4tls_dispatch"));
 }
 
-export fn r4tls_init(api: *const r4os.r4dev.ProtocolApi) callconv(.c) i32 {
-    r4os.secure_random.bindProtocol(api);
+export fn r4tls_init(api: *const r4os.r4dev.ProtocolApi2) callconv(.c) i32 {
+    var ctx = r4os.r4dev.ProtocolContext2.init(api);
+    if (!ctx.requires(.{ "register_role", "set_status", "file_read" })) return r4os.abi.err_no_fn;
+    const registered = ctx.registerRole("security.tls", .data, 0);
+    if (registered != 0) return registered;
+    ctx.bindEntropy();
+    var published = false;
+    defer if (!published) r4os.secure_random.Provider.bind(.{});
     protocol_api = api;
     sha_executor = null;
-    if (r4os.cpu_acceleration.protocolInfo(api)) |get_info| {
+    defer if (!published) {
+        protocol_api = null;
+        sha_executor = null;
+        resetSystemTlsMaterial();
+    };
+    if (ctx.function("cpu_acceleration_info")) |get_info| {
         var info: r4os.abi.CpuAccelerationInfo = .{};
         if (get_info(&info) == 0 and info.os_mask & r4os.abi.cpu_accel_feature_sha != 0)
-            sha_executor = r4os.cpu_acceleration.protocolWork(api);
+            sha_executor = ctx.function("cpu_acceleration_work");
     }
-    var ctx = r4os.r4dev.ProtocolContext.init(api);
     ctx.logInfo("R4TLS.R4P init");
-    _ = ctx.registerRole("security.tls", .data, 0);
     loadSystemTlsFiles(&ctx);
-    _ = ctx.setStatus(.active, if (system_cert_loaded and system_key_loaded) "R4TLS TLS core active, system TLS files loaded" else "R4TLS TLS core active, system TLS files incomplete");
-    return 0;
+    const result = ctx.setStatus(.active, if (system_cert_loaded and system_key_loaded) "R4TLS TLS core active, system TLS files loaded" else "R4TLS TLS core active, system TLS files incomplete");
+    published = result == 0;
+    return result;
 }
 
 export fn r4tls_shutdown() callconv(.c) i32 {
+    r4os.secure_random.Provider.bind(.{});
     sha_executor = null;
     protocol_api = null;
+    resetSystemTlsMaterial();
     return 0;
 }
 
@@ -1026,7 +1040,7 @@ fn describeProductiveContract(in_buffer: *const r4os.abi.ProtocolBuffer, out_buf
     return writeOut(out_buffer, text[0..pos]);
 }
 
-fn loadSystemTlsFiles(ctx: *const r4os.r4dev.ProtocolContext) void {
+fn loadSystemTlsFiles(ctx: *const r4os.r4dev.ProtocolContext2) void {
     resetSystemTlsMaterial();
 
     var cert_buf: [4096]u8 = .{0} ** 4096;
@@ -1126,7 +1140,7 @@ fn getSystemTlsMaterial() ?TlsMaterialView {
 fn ensureSystemTlsMaterialLoaded() void {
     if (system_cert_loaded and system_key_loaded and system_key_context.valid and system_cert_der_len != 0 and system_root_loaded and system_root_count != 0) return;
     const api = protocol_api orelse return;
-    var ctx = r4os.r4dev.ProtocolContext.init(api);
+    var ctx = r4os.r4dev.ProtocolContext2.init(api);
     loadSystemTlsFiles(&ctx);
 }
 
@@ -2339,7 +2353,7 @@ fn tls12ClientServerFlightDispatch(in_buffer: *const r4os.abi.ProtocolBuffer, ou
 
 fn clientFlightFailure(comptime message: [:0]const u8, rc: i32) i32 {
     if (protocol_api) |api| {
-        var ctx = r4os.r4dev.ProtocolContext.init(api);
+        var ctx = r4os.r4dev.ProtocolContext2.init(api);
         ctx.logError(message);
     }
     return rc;
@@ -2910,7 +2924,7 @@ fn selftestP384Signature() bool {
 
 fn clientHarnessFailure(comptime message: [:0]const u8, rc: i32) i32 {
     if (protocol_api) |api| {
-        var ctx = r4os.r4dev.ProtocolContext.init(api);
+        var ctx = r4os.r4dev.ProtocolContext2.init(api);
         ctx.logError(message);
     }
     return rc;
@@ -4088,21 +4102,27 @@ fn isProtectableContentType(content_type: u8) bool {
 }
 
 fn inputBytes(buffer: *const r4os.abi.ProtocolBuffer) ?[]const u8 {
-    if (buffer.data == null) return null;
-    const ptr: [*]const u8 = @ptrCast(buffer.data.?);
-    return ptr[0..@intCast(buffer.len)];
+    const ptr = buffer.data orelse return null;
+    if (buffer.reserved != 0 or buffer.flags != 0 or buffer.len > buffer.capacity) return null;
+    const bytes = buffer.len;
+    if (@addWithOverflow(@intFromPtr(ptr), buffer.capacity)[1] != 0) return null;
+    if (bytes != 0) _ = r4os.native_protocol_view.admit(buffer, r4os.native_protocol_view.Policy.record(u8, .input, .prefix), .input) catch return null;
+    return @as([*]const u8, @ptrCast(ptr))[0..bytes];
 }
 
 fn outputBytes(buffer: *r4os.abi.ProtocolBuffer) ?[]u8 {
-    if (buffer.data == null) return null;
-    const ptr: [*]u8 = @ptrCast(buffer.data.?);
-    return ptr[0..@intCast(buffer.capacity)];
+    const ptr = buffer.data orelse return null;
+    if (buffer.reserved != 0 or buffer.flags != 0 or buffer.len > buffer.capacity) return null;
+    const bytes = buffer.capacity;
+    if (@addWithOverflow(@intFromPtr(ptr), buffer.capacity)[1] != 0) return null;
+    if (bytes != 0) _ = r4os.native_protocol_view.admit(buffer, r4os.native_protocol_view.Policy.record(u8, .output, .prefix), .output) catch return null;
+    return @as([*]u8, @ptrCast(ptr))[0..bytes];
 }
 
 fn tcpResultFromBuffer(buffer: *const r4os.abi.ProtocolBuffer) ?*const r4os.abi.NetServiceTcpResult {
-    if (buffer.data == null) return null;
-    if (buffer.len < @sizeOf(r4os.abi.NetServiceTcpResult)) return null;
-    return @ptrCast(@alignCast(buffer.data.?));
+    const native = r4os.native_protocol_view;
+    const T = r4os.abi.NetServiceTcpResult;
+    return (native.Input(T).init(buffer, native.Policy.record(T, .input, .prefix)) catch return null).value;
 }
 
 fn streamFixtureProtectByte(value: u8, index: usize) u8 {
@@ -4226,7 +4246,8 @@ fn cipherName(cipher: u16) []const u8 {
 }
 
 fn readBe16(bytes: []const u8) usize {
-    return (@as(usize, bytes[0]) << 8) | bytes[1];
+    var reader = r4os.binary_cursor.Reader.init(bytes) catch unreachable;
+    return reader.readInt(u16, .big) catch unreachable;
 }
 
 fn readBe24(bytes: []const u8) usize {
@@ -4234,21 +4255,18 @@ fn readBe24(bytes: []const u8) usize {
 }
 
 fn readBe32(bytes: []const u8) usize {
-    return (@as(usize, bytes[0]) << 24) | (@as(usize, bytes[1]) << 16) | (@as(usize, bytes[2]) << 8) | bytes[3];
+    var reader = r4os.binary_cursor.Reader.init(bytes) catch unreachable;
+    return reader.readInt(u32, .big) catch unreachable;
 }
 
 fn readBe64(bytes: []const u8) u64 {
-    var out: u64 = 0;
-    var i: usize = 0;
-    while (i < 8) : (i += 1) {
-        out = (out << 8) | bytes[i];
-    }
-    return out;
+    var reader = r4os.binary_cursor.Reader.init(bytes) catch unreachable;
+    return reader.readInt(u64, .big) catch unreachable;
 }
 
 fn writeBe16(out: []u8, value: u16) void {
-    out[0] = @intCast(value >> 8);
-    out[1] = @intCast(value & 0xFF);
+    var writer = r4os.binary_cursor.Writer.init(out) catch unreachable;
+    writer.writeInt(u16, value, .big) catch unreachable;
 }
 
 fn writeBe24(out: []u8, value: u24) void {
@@ -4258,20 +4276,13 @@ fn writeBe24(out: []u8, value: u24) void {
 }
 
 fn writeBe32(out: []u8, value: u32) void {
-    out[0] = @intCast((value >> 24) & 0xFF);
-    out[1] = @intCast((value >> 16) & 0xFF);
-    out[2] = @intCast((value >> 8) & 0xFF);
-    out[3] = @intCast(value & 0xFF);
+    var writer = r4os.binary_cursor.Writer.init(out) catch unreachable;
+    writer.writeInt(u32, value, .big) catch unreachable;
 }
 
 fn writeBe64(out: []u8, value: u64) void {
-    var shift: u6 = 56;
-    var i: usize = 0;
-    while (i < 8) : (i += 1) {
-        out[i] = @intCast((value >> shift) & 0xFF);
-        if (shift == 0) break;
-        shift -= 8;
-    }
+    var writer = r4os.binary_cursor.Writer.init(out) catch unreachable;
+    writer.writeInt(u64, value, .big) catch unreachable;
 }
 
 fn appendText(out: []u8, pos: *usize, text: []const u8) void {
